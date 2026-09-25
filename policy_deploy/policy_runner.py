@@ -49,9 +49,9 @@ CONTROL_HZ = 11.0       # 真机部署默认节拍；给上一条动作更多执
 # 不设更大：提前得越多，动作用的画面越旧，反应越迟钝，对毫米级对准是实打实的代价。
 # 换到更慢的显卡上先跑 selftest.py，漏拍了再往上调。
 TRIGGER_LEFT = 2
-D94_STATE_HISTORY_OFFSETS = (-48, -43, -37, -32, -27, -21, -16, -11, -5, 0)
-D94_STATE_DIM = 11
-D94_STATE_HISTORY_HIDDEN = 64
+STATE_HISTORY_OFFSETS = (-48, -43, -37, -32, -27, -21, -16, -11, -5, 0)
+STATE_DIM = 11
+STATE_HISTORY_HIDDEN = 64
 
 THIRD_SIZE = (512, 910)       # 第三视角原图尺寸 (高, 宽)
 WRIST_SIZE = (512, 910)
@@ -298,18 +298,41 @@ class PolicyRunner:
                  task: str = "insert the plug into the power strip",
                  pipelined: bool = True, trigger_left: int = TRIGGER_LEFT,
                  record_dir: str | None = None, record_images: bool = True,
-                 rtc: bool = True):
+                 rtc: bool = True, rtc_mode: str | None = None):
         from lerobot.policies.smolvla.modeling_smolvla import SmolVLAPolicy
         from lerobot.policies.factory import make_pre_post_processors
 
         self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
         ckpt = Path(ckpt_dir)
-        self.policy = SmolVLAPolicy.from_pretrained(ckpt).to(self.device).eval()
+        # Deployment must never continue with silently missing or unexpected
+        # weights.  New modules/renames are a checkpoint migration, not a warning.
+        self.policy = SmolVLAPolicy.from_pretrained(ckpt, strict=True).to(self.device).eval()
         cfg = self.policy.config
-        # RTC（real-time chunking，默认开）：换动作块时，把上一块**还没执行完的尾巴**
-        # 作为软约束喂给去噪过程，让新块的开头跟旧块正在执行的部分接得上，压掉块交界的
-        # 跳变。纯推理期机制，任何存档都能用，不改训练。关掉：PolicyRunner(..., rtc=False)。
-        self.rtc = bool(rtc)
+        # 动作块之间怎么接得上，有三种方式，由 rtc_mode 选：
+        #
+        #   "train"      模型在训练时就学过"给定已发出的这几步、把后面接上"。
+        #                推理时只是普通前向，快（实测 117 毫秒）。
+        #                前提：这个存档必须是开了 rtc_train_enabled 训出来的。
+        #   "inference"  模型照常算完，再用引导把结果掰得跟已发出的动作接上。
+        #                每个去噪步要多做一次反向传播，慢（实测 262 毫秒）。
+        #                任何存档都能用，不需要特殊训练。
+        #   "off"        什么都不做，块之间可能有跳变。用来做对照。
+        #
+        # 不传 rtc_mode 就自动判断：存档说自己是训练期 RTC 训的就用 "train"，
+        # 否则用 "inference"（rtc=False 时用 "off"）。日常部署不用管这个参数。
+        trained_with_prefix = bool(getattr(cfg, "rtc_train_enabled", False))
+        if rtc_mode is None:
+            rtc_mode = "train" if trained_with_prefix else ("inference" if rtc else "off")
+        if rtc_mode not in ("train", "inference", "off"):
+            raise ValueError(f"rtc_mode 只能是 train/inference/off，收到 {rtc_mode!r}")
+        if rtc_mode == "train" and not trained_with_prefix:
+            # 普通存档没见过"前缀"这种输入，硬喂给它等于给它一段看不懂的开头。
+            raise RuntimeError(
+                "rtc_mode='train' 需要用 rtc_train_enabled=True 训出来的存档，"
+                "这个存档不是。要对比的话用 rtc_mode='inference' 或 'off'。")
+        self.rtc_mode = rtc_mode
+        self.rtc_train = rtc_mode == "train"
+        self.rtc = rtc_mode == "inference"
         if self.rtc:
             from lerobot.policies.rtc.configuration_rtc import RTCConfig
             cfg.rtc_config = RTCConfig(enabled=True,
@@ -336,6 +359,26 @@ class PolicyRunner:
         self.chunk_size = int(cfg.chunk_size)
         self.pipelined = pipelined
         self.trigger_left = int(trigger_left)
+        self.sampling_contract_version = int(
+            getattr(cfg, "franka_sampling_contract_version", 0)
+        )
+        self.max_async_skip = int(getattr(cfg, "franka_max_async_skip", 0))
+        # 这里只查**调用方能弄错**的东西。
+        #
+        # 曾经还查过 chunk_size / n_action_steps / franka_execution_horizon /
+        # loss_mask_action_pad 等等，已经删掉：前三个来自存档自己的 config，
+        # 训练流水线生成配置时就闸过了，同一个值查第二遍不会发现第一遍没发现的东西；
+        # 后两个是训练期的损失开关，对推理没有任何影响。它们唯一的实际效果是
+        # 挡住合理的使用（比如临时把 n_action_steps 调小做对照实验）。
+        #
+        # trigger_left 不一样：它是构造时传进来的参数，不来自存档。调大它能多换
+        # 一点流水线余量，但一旦超过训练时的最大跳过步数，动作和时间就对不上了，
+        # 而且**不会有任何报错**——手臂照走，只是走的是错位的计划。
+        if self.max_async_skip and not (0 <= self.trigger_left <= self.max_async_skip):
+            raise RuntimeError(
+                f"trigger_left={self.trigger_left} 超出这个存档训练时的最大跳过步数 "
+                f"{self.max_async_skip}：动作块会和时间错位。"
+            )
         # 录制：默认关。开了之后每局都存状态/动作/触觉，原图只在失败的局落盘。
         self.rec = None
         if record_dir:
@@ -356,31 +399,31 @@ class PolicyRunner:
             getattr(cfg, "tactile_state_history_enabled", False)
         )
         if self.needs_state_hist:
-            expected_offsets = list(D94_STATE_HISTORY_OFFSETS)
+            expected_offsets = list(STATE_HISTORY_OFFSETS)
             if self.state_hist_offsets != expected_offsets:
                 raise RuntimeError(
-                    "this deploy package only accepts the audited D94 state taps: "
+                    "this deploy package only accepts the audited state-history taps: "
                     f"expected={expected_offsets}, got={self.state_hist_offsets}"
                 )
             if not self.uses_tactile or not self.needs_hist:
-                raise RuntimeError("D94 state history requires the tactile history path")
+                raise RuntimeError("state history requires the tactile history path")
             if self.state_hist_offsets != self.hist_offsets + [0]:
                 raise RuntimeError(
                     "state and tactile history taps must match exactly: "
                     f"state={self.state_hist_offsets}, tactile={self.hist_offsets + [0]}"
                 )
             state_shape = tuple(cfg.input_features["observation.state"].shape)
-            if state_shape != (D94_STATE_DIM,):
+            if state_shape != (STATE_DIM,):
                 raise RuntimeError(
-                    f"D94 state shape must be ({D94_STATE_DIM},), got {state_shape}"
+                    f"state shape must be ({STATE_DIM},), got {state_shape}"
                 )
-            if int(getattr(cfg, "tactile_state_history_hidden", -1)) != D94_STATE_HISTORY_HIDDEN:
+            if int(getattr(cfg, "tactile_state_history_hidden", -1)) != STATE_HISTORY_HIDDEN:
                 raise RuntimeError(
-                    "D94 state-history hidden size must be "
-                    f"{D94_STATE_HISTORY_HIDDEN}"
+                    "state-history hidden size must be "
+                    f"{STATE_HISTORY_HIDDEN}"
                 )
             if bool(getattr(cfg, "tactile_state_history_repeat_current", True)):
-                raise RuntimeError("D94 requires real state history, not repeat_current")
+                raise RuntimeError("the final policy requires real state history, not repeat_current")
             if getattr(self.policy.model, "state_history_encoder", None) is None:
                 raise RuntimeError("checkpoint enabled state history but built no encoder")
         self._state_hist_len = (
@@ -417,7 +460,7 @@ class PolicyRunner:
         except Exception as e:
             if self.needs_state_hist:
                 raise RuntimeError(
-                    "D94 state-history warmup failed; refusing to start real control"
+                    "state-history warmup failed; refusing to start real control"
                 ) from e
             # Legacy checkpoints historically allowed a failed dummy warmup and paid
             # the one-time latency on the first real chunk instead.
@@ -616,13 +659,28 @@ class PolicyRunner:
         """RTC 的两个输入，在**主线程**上算好再交给推理线程（避免竞态）：
         prev_chunk_left_over = 上一块从「当前拍」起还没执行的尾巴（归一化空间）；
         inference_delay      = 推理期间还会被执行掉的步数 = 此刻队列里剩几步。"""
-        if not self.rtc or self._last_chunk is None:
+        if self._last_chunk is None or not (self.rtc or self.rtc_train):
             return {}
         off = self._tick - self._last_t0
         if off < 0 or off >= self._last_chunk.shape[1]:
             return {}
-        return {"prev_chunk_left_over": self._last_chunk[:, off:, :],
-                "inference_delay": int(len(self._acts))}
+        left_over = self._last_chunk[:, off:, :]
+        delay = int(len(self._acts))
+        if self.rtc_train:
+            # 同样这两个量，去向不同：训练期 RTC 直接把前 delay 步当条件喂进去噪循环。
+            # 前缀保持在归一化空间（_last_chunk 是模型原始输出、没过反归一化），
+            # 与训练时的加噪动作在同一个空间。
+            #
+            # 但必须先把填充维清零。模型的动作向量固定 32 维，Franka 只用前 7 维，
+            # 后 25 维在训练时由 pad_vector 填成精确的 0；而这里的 left_over 是模型
+            # 自己的输出，后 25 维没有任何损失监督过（loss_exclude_padded_action_dims），
+            # 实测幅度比真信号还大。不清零的话，送回模型的前缀有 25/32 的宽度是
+            # 训练时从没出现过的值，而接收它的 nn.Linear(32, ...) 会把它们全乘进去。
+            n = int(self.policy.config.action_feature.shape[0])
+            prefix = left_over.clone()
+            prefix[..., n:] = 0
+            return {"rtc_action_prefix": prefix, "rtc_delay": delay}
+        return {"prev_chunk_left_over": left_over, "inference_delay": delay}
 
     def _launch(self, raw: dict) -> None:
         hist = self._stack_history()
@@ -690,8 +748,11 @@ class PolicyRunner:
         if self.needs_hist:                            # 预处理不搬这个键，自己搬
             batch[f"{key}_is_pad"] = batch[f"{key}_is_pad"].to(self.device)
         full = self._sample_chunk(batch, rtc_kw or {})     # (1, 50, max_action_dim) 归一化
-        if self.rtc:
-            self._last_chunk = full.detach()               # 下一次 RTC 的 prev
+        if self.rtc or self.rtc_train:
+            # 两条路都要存：推理期 RTC 拿它做引导的目标，训练期 RTC 拿它当前缀。
+            # 这里漏掉 rtc_train 的话前缀永远是 None，而且不会有任何报错——
+            # 模型训练时见过"没有前缀"的样本，会若无其事地跑下去。
+            self._last_chunk = full.detach()
             self._last_t0 = t0                             # 该块 step k <-> 拍 t0+k
         out = self.post(full[:, :, : self.policy.config.action_feature.shape[0]])
         return out.squeeze(0).float().cpu().numpy()    # (50, 7)
@@ -699,6 +760,12 @@ class PolicyRunner:
     def _absorb(self, chunk: np.ndarray, t0: int) -> None:
         """把新算出来的一串接上。跳过开算之后已经过去的那几步，保证动作和时间对得上。"""
         skip = max(0, self._tick - t0)
+        # 这一条留着：skip 是运行期算出来的，超了说明节拍前提变了，
+        # 而错位的动作块发出去手臂照走，不会自己报错。
+        if self.max_async_skip and skip > self.max_async_skip:
+            raise RuntimeError(
+                f"动作对齐 skip={skip} 超过这个存档训练时的最大值 {self.max_async_skip}"
+            )
         take = chunk[skip: skip + self.n_action_steps]
         if len(take) == 0:
             # 到不了这儿：_join() 里的 join 没有超时，后台算不完主循环就卡着等，

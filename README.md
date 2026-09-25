@@ -24,8 +24,13 @@ bridge, and the GelSight tactile node that feeds it. Extracted from the full
 
 - **Checkpoint weights + vendored `lerobot_fork/`** — hosted on Hugging Face at
   `tliangucl/realrobot-plug-smolvla`. `policy_deploy/` expects to sit next to
-  (or be pointed at, via `smolvla_policy_node.py --deploy-pkg-dir`) a checkout
-  of that repo's `lerobot_fork/` and a chosen `checkpoints/.../<ckpt>/` dir.
+  (or be pointed at, via the launch files' `deploy_pkg_dir` arg /
+  `smolvla_policy_node.py --deploy-pkg-dir`) a checkout of that repo's
+  `lerobot_fork/` and a chosen `checkpoints/.../<ckpt>/` dir. Pass
+  `deploy_pkg_dir` explicitly for checkpoints that live several levels under
+  the deploy root (e.g. `checkpoints/D93_idle_tail_v4_jpeg/vision/20k`) —
+  `smolvla_policy_node.py` can no longer infer it from `ckpt_dir`'s immediate
+  parent.
 - **`gsrobotics` SDK** — a separate third-party repo that `gelsight_node.py`
   sys.path-injects at runtime (`GSROBOTICS_PATH` env var), including the FEATS
   model weights (`unet_09042025_124903_80.pt`) and normalization file.
@@ -55,9 +60,16 @@ ros2 launch franky_ros2 vla_test.launch.py ckpt_dir:=checkpoints/realrobot-plug-
 ros2 launch franky_ros2 vla_test.launch.py ckpt_dir:=checkpoints/realrobot-plug-smolvla/ckpt_tactile_D93_recovery_v2_20k task:="insert the plug into the power strip"  record_dir:=runs/eval_tactile_v2 live:=true dynamics_factor:=0.08
 ```
 
-Key args: `venv_python` (default `/home/xinyun/lerobot-env/bin/python3`), `ckpt_dir`, `task`,
+Key args: `venv_python` (default `/home/xinyun/lerobot-env/bin/python3`), `ckpt_dir`,
+`deploy_pkg_dir` (default `checkpoints/realrobot-plug-smolvla`), `task`,
 `live` (default `false` = dry-run/log-only, no motion/gripper commands published),
 `record_dir` (if set, records rollouts under this dir), `visualize_cameras`.
+
+On a motion-command exception, `franky_control_node_orientation.py` now checks
+`robot.has_errors` and calls `robot.recover_from_errors()` automatically (e.g. after
+a Cartesian-discontinuity reflex trip) rather than requiring a manual `"recover"`
+command — that manual command below still exists as a separate, deliberate e-stop
+recovery path.
 
 Once launched, start the policy loop from another terminal:
 

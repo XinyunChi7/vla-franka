@@ -30,6 +30,7 @@ def generate_launch_description():
     feats_norm_path = LaunchConfiguration('feats_norm_path')
     venv_python = LaunchConfiguration('venv_python')
     ckpt_dir = LaunchConfiguration('ckpt_dir')
+    deploy_pkg_dir = LaunchConfiguration('deploy_pkg_dir')
     task = LaunchConfiguration('task')
     live = LaunchConfiguration('live')
     record_dir = LaunchConfiguration('record_dir')
@@ -74,6 +75,15 @@ def generate_launch_description():
             'ckpt_dir',
             default_value='checkpoints/realrobot-plug-smolvla/ckpt_vision',
             description='Policy checkpoint dir, passed to smolvla_policy_node.py --ckpt-dir'
+        ),
+        DeclareLaunchArgument(
+            'deploy_pkg_dir',
+            default_value='checkpoints/realrobot-plug-smolvla',
+            description="Deploy package root (has policy_runner.py, lerobot_fork/), passed to "
+                        "smolvla_policy_node.py --deploy-pkg-dir. Needed explicitly because "
+                        "newer checkpoints live several levels under this root (e.g. "
+                        "checkpoints/D93_idle_tail_v4_jpeg/vision/20k), so the node can no "
+                        "longer infer it from ckpt_dir's immediate parent."
         ),
         DeclareLaunchArgument(
             'task',
@@ -204,14 +214,16 @@ def generate_launch_description():
         # interpreter instead of a launch_ros Node action; cwd matches the README's
         # `cd /home/xinyun/vlm-franka` so the default relative ckpt_dir resolves.
         ExecuteProcess(
-            cmd=[venv_python, POLICY_SCRIPT, '--ckpt-dir', ckpt_dir, '--task', task,
+            cmd=[venv_python, POLICY_SCRIPT, '--ckpt-dir', ckpt_dir,
+                 '--deploy-pkg-dir', deploy_pkg_dir, '--task', task,
                  '--record-dir', record_dir, '--live'],
             cwd=REPO_ROOT,
             output='screen',
             condition=IfCondition(live),
         ),
         ExecuteProcess(
-            cmd=[venv_python, POLICY_SCRIPT, '--ckpt-dir', ckpt_dir, '--task', task,
+            cmd=[venv_python, POLICY_SCRIPT, '--ckpt-dir', ckpt_dir,
+                 '--deploy-pkg-dir', deploy_pkg_dir, '--task', task,
                  '--record-dir', record_dir],
             cwd=REPO_ROOT,
             output='screen',

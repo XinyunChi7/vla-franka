@@ -9,7 +9,7 @@ from geometry_msgs.msg import Pose, PoseStamped
 from sensor_msgs.msg import JointState
 from std_msgs.msg import Bool, Float32, String
 
-from franky import Robot, Gripper, CartesianMotion, ReferenceType, Affine
+from franky import Robot, Gripper, CartesianMotion, ReferenceType, Affine, RealtimeConfig
 
 JOINT_NAMES = [f"panda_joint{i}" for i in range(1, 8)]
 STATE_PUBLISH_RATE_HZ = 20.0
@@ -71,7 +71,12 @@ class FrankaOrientationController(Node):
         self.get_logger().info("Initializing Franka robot...")
 
         try:
-            self.robot = Robot("192.168.1.11")
+            # realtime_config=Ignore: this box runs a generic (non-PREEMPT_RT) kernel, and
+            # without this libfranka refuses every motion command with "Running kernel does
+            # not have realtime capabilities." (see franky's generic-kernel support,
+            # https://github.com/TimSchneider42/franky/pull/1). robot_agent_node.py already
+            # relies on this successfully; this node just hadn't been updated to match.
+            self.robot = Robot("192.168.1.11", realtime_config=RealtimeConfig.Ignore)
             self.gripper = Gripper("192.168.1.11")
             # 动力学系数，改成 ROS 参数，不用改代码就能调：
             #   -p dynamics_factor:=0.07   （用 launch 启动时要写进 launch 的 parameters）
@@ -151,6 +156,7 @@ class FrankaOrientationController(Node):
             self.robot.move(motion, asynchronous=True)
         except Exception as e:
             self.get_logger().error(f"Motion command failed: {e}")
+            self._auto_recover("pose_callback")
 
     def pose_absolute_callback(self, msg: Pose):
         translation = [msg.position.x, msg.position.y, msg.position.z]
@@ -168,6 +174,20 @@ class FrankaOrientationController(Node):
             self.robot.move(motion, asynchronous=True)
         except Exception as e:
             self.get_logger().error(f"Absolute motion command failed: {e}")
+            self._auto_recover("pose_absolute_callback")
+
+    def _auto_recover(self, context: str):
+        # Gated on has_errors (a real franka safety-reflex trip, e.g. the Cartesian
+        # discontinuity reflex dynamics_factor tuning can provoke -- see the comment above)
+        # so this doesn't mask a genuine connection failure by attempting recovery when
+        # there's nothing to recover from. Deliberate estop (see command_callback) is a
+        # separate path and intentionally still requires an explicit "recover" command.
+        try:
+            if self.robot.has_errors:
+                ok = self.robot.recover_from_errors()
+                self.get_logger().warn(f"{context}: auto-recovered from robot error state (ok={ok}).")
+        except Exception as recover_exc:
+            self.get_logger().error(f"{context}: auto-recovery attempt itself failed: {recover_exc}")
 
     def command_callback(self, msg: String):
         command = msg.data
